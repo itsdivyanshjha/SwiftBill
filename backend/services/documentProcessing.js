@@ -2,6 +2,7 @@ const genai = require('@google/generative-ai');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs').promises;
+const logger = require('../utils/logger');
 require('dotenv').config();
 const Papa = require('papaparse');
 
@@ -39,6 +40,11 @@ const upload = multer({
 class DocumentProcessingService {
   async processDocument(file) {
     try {
+      logger.info('Starting document processing for file:', {
+        filename: file.originalname,
+        mimetype: file.mimetype
+      });
+
       const model = genaiInstance.getGenerativeModel({ model: "gemini-1.5-pro" });
       const fileContent = await fs.readFile(file.path);
       
@@ -51,64 +57,99 @@ class DocumentProcessingService {
         extractedData = await this.processSpreadsheet(fileContent);
       }
 
-      console.log('Extracted Data:', extractedData);
+      if (!extractedData) {
+        logger.error('No data extracted from file');
+        throw new Error('No data could be extracted from the file');
+      }
+
+      // Add default values for missing fields
+      extractedData = {
+        serialNumber: extractedData.serialNumber || `INV-${Date.now()}`,
+        date: extractedData.date || new Date().toISOString(),
+        customerName: extractedData.customerName || 'Unknown Customer',
+        productName: extractedData.productName || 'Unknown Product',
+        quantity: extractedData.quantity || 1,
+        unitPrice: extractedData.unitPrice || 0,
+        taxAmount: extractedData.taxAmount || 0,
+        discount: extractedData.discount || 0,
+        priceWithTax: extractedData.priceWithTax || 0,
+        totalAmount: extractedData.totalAmount || 0,
+        customerEmail: extractedData.customerEmail || '',
+        customerPhone: extractedData.phoneNumber || '',
+        customerAddress: extractedData.address || ''
+      };
+
+      logger.info('Data extracted successfully:', extractedData);
+
+      // Validate the data
+      if (!this.validateExtractedData(extractedData)) {
+        logger.error('Validation failed for extracted data:', extractedData);
+        throw new Error('Invalid or incomplete data extracted');
+      }
+
       return extractedData;
     } catch (error) {
-      console.error('Document Processing Error:', error);
+      logger.error('Document Processing Error:', error);
       throw new Error(`Document processing failed: ${error.message}`);
     }
   }
 
   async processPDF(model, fileContent) {
     try {
-      const prompt = `Extract the following information from this invoice PDF and format it exactly as shown:
+      const prompt = `Extract the following information from this tax invoice:
 
-Required Invoice Information:
-- Invoice/Serial Number (look for Invoice #, Reference #, Order #)
-- Date (any date format)
-- Customer Information:
-  * Customer Name
-  * Phone Number
-  * Email (if available)
-  * Address (if available)
-- Product Details:
-  * Product Name/Description
-  * Quantity
-  * Unit Price
-  * Tax Amount
-  * Discount (if any)
-  * Price with Tax
-  * Total Amount
+1. Invoice Number (INV-54CZS format)
+2. Invoice Date (DD MMM YYYY format)
+3. Company Details:
+   - Name
+   - GSTIN
+   - Address
+   - Mobile
+   - Email
+4. Customer Details:
+   - Name (from Consignee or Buyer section)
+   - Address
+5. Items (extract first item's details):
+   - Description
+   - Tax Rate (%)
+   - Quantity
+   - Rate/Item
+   - Amount
 
-Please format the response exactly as:
-Serial Number: [value]
+Format the response exactly as:
+Invoice Number: [value]
 Date: [value]
+Company Name: [value]
+GSTIN: [value]
+Company Address: [value]
+Company Mobile: [value]
+Company Email: [value]
 Customer Name: [value]
-Phone Number: [value]
-Email: [value]
-Address: [value]
-Product Name: [value]
+Customer Address: [value]
+Product Description: [value]
+Tax Rate: [value]
 Quantity: [value]
 Unit Price: [value]
-Tax Amount: [value]
-Discount: [value]
-Price with Tax: [value]
-Total Amount: [value]`;
+Amount: [value]`;
 
       const response = await model.generateContent([
         { text: prompt },
         { inlineData: { data: fileContent.toString('base64'), mimeType: 'application/pdf' } }
       ]);
 
-      return this.parseExtractedData(response.response.text());
+      const result = await response.response.text();
+      logger.info('PDF processing response:', result);
+
+      return this.parseExtractedData(result);
     } catch (error) {
-      console.error('PDF Processing Error:', error);
+      logger.error('PDF Processing Error:', error);
       throw new Error(`PDF processing failed: ${error.message}`);
     }
   }
 
   async processImage(model, fileContent) {
     try {
+      logger.info('Processing image file');
       // Use the same prompt as PDF processing for consistency
       const prompt = `Extract the following information from this invoice image and format it exactly as shown:
       [Same prompt as PDF processing]`;
@@ -120,13 +161,14 @@ Total Amount: [value]`;
 
       return this.parseExtractedData(response.response.text());
     } catch (error) {
-      console.error('Image Processing Error:', error);
+      logger.error('Image Processing Error:', error);
       throw new Error(`Image processing failed: ${error.message}`);
     }
   }
 
   async processSpreadsheet(fileContent) {
     try {
+      logger.info('Processing spreadsheet file');
       // Use PapaParse for CSV/Excel processing
       const csvData = fileContent.toString();
       return new Promise((resolve, reject) => {
@@ -155,48 +197,54 @@ Total Amount: [value]`;
         });
       });
     } catch (error) {
-      console.error('Spreadsheet Processing Error:', error);
+      logger.error('Spreadsheet Processing Error:', error);
       throw new Error(`Spreadsheet processing failed: ${error.message}`);
     }
   }
 
   parseExtractedData(text) {
-    console.log('Parsing text:', text);
+    logger.debug('Parsing extracted text:', text);
 
     try {
       const patterns = {
-        serialNumber: /(?:Serial Number|Invoice #|Reference #):\s*([^\n]*)/i,
+        serialNumber: /Invoice Number:\s*([^\n]*)/i,
         date: /Date:\s*([^\n]*)/i,
+        companyName: /Company Name:\s*([^\n]*)/i,
+        gstin: /GSTIN:\s*([^\n]*)/i,
+        companyAddress: /Company Address:\s*([^\n]*)/i,
+        companyMobile: /Company Mobile:\s*([^\n]*)/i,
+        companyEmail: /Company Email:\s*([^\n]*)/i,
         customerName: /Customer Name:\s*([^\n]*)/i,
-        phoneNumber: /Phone Number:\s*([^\n]*)/i,
-        email: /Email:\s*([^\n]*)/i,
-        address: /Address:\s*([^\n]*)/i,
-        productName: /Product Name:\s*([^\n]*)/i,
-        quantity: /Quantity:\s*(\d+)/i,
-        unitPrice: /Unit Price:\s*\$?(\d+\.?\d*)/i,
-        taxAmount: /Tax Amount:\s*\$?(\d+\.?\d*)/i,
-        discount: /Discount:\s*\$?(\d+\.?\d*)/i,
-        priceWithTax: /Price with Tax:\s*\$?(\d+\.?\d*)/i,
-        totalAmount: /Total Amount:\s*\$?(\d+\.?\d*)/i
+        customerAddress: /Customer Address:\s*([^\n]*)/i,
+        productName: /Product Description:\s*([^\n]*)/i,
+        taxRate: /Tax Rate:\s*(\d+(?:\.\d+)?)/i,
+        quantity: /Quantity:\s*(\d+(?:\.\d+)?)/i,
+        unitPrice: /Unit Price:\s*(\d+(?:\.\d+)?)/i,
+        amount: /Amount:\s*(\d+(?:\.\d+)?)/i
       };
 
       const data = {
-        serialNumber: text.match(patterns.serialNumber)?.[1]?.trim(),
+        serialNumber: text.match(patterns.serialNumber)?.[1]?.trim() || '',
         date: text.match(patterns.date)?.[1]?.trim() || new Date().toISOString(),
-        customerName: text.match(patterns.customerName)?.[1]?.trim(),
-        phoneNumber: text.match(patterns.phoneNumber)?.[1]?.trim(),
-        email: text.match(patterns.email)?.[1]?.trim(),
-        address: text.match(patterns.address)?.[1]?.trim(),
-        productName: text.match(patterns.productName)?.[1]?.trim(),
+        companyName: text.match(patterns.companyName)?.[1]?.trim() || '',
+        gstin: text.match(patterns.gstin)?.[1]?.trim() || '',
+        companyAddress: text.match(patterns.companyAddress)?.[1]?.trim() || '',
+        companyMobile: text.match(patterns.companyMobile)?.[1]?.trim() || '',
+        companyEmail: text.match(patterns.companyEmail)?.[1]?.trim() || '',
+        customerName: text.match(patterns.customerName)?.[1]?.trim() || '',
+        customerAddress: text.match(patterns.customerAddress)?.[1]?.trim() || '',
+        productName: text.match(patterns.productName)?.[1]?.trim() || '',
+        taxAmount: parseFloat(text.match(patterns.taxRate)?.[1] || '0'),
         quantity: parseInt(text.match(patterns.quantity)?.[1] || '0'),
         unitPrice: parseFloat(text.match(patterns.unitPrice)?.[1] || '0'),
-        taxAmount: parseFloat(text.match(patterns.taxAmount)?.[1] || '0'),
-        discount: parseFloat(text.match(patterns.discount)?.[1] || '0'),
-        priceWithTax: parseFloat(text.match(patterns.priceWithTax)?.[1] || '0'),
-        totalAmount: parseFloat(text.match(patterns.totalAmount)?.[1] || '0')
+        totalAmount: parseFloat(text.match(patterns.amount)?.[1] || '0')
       };
 
-      console.log('Extracted data:', data);
+      // Calculate missing fields if necessary
+      data.priceWithTax = data.totalAmount;
+      data.discount = 0;
+
+      logger.info('Extracted data:', data);
 
       if (!this.validateExtractedData(data)) {
         throw new Error('Invalid or incomplete data extracted');
@@ -204,44 +252,30 @@ Total Amount: [value]`;
 
       return data;
     } catch (error) {
-      console.error('Parsing Error:', error);
+      logger.error('Parsing Error:', error);
       throw new Error(`Data parsing failed: ${error.message}`);
     }
   }
 
   validateExtractedData(data) {
-    // Required fields for each tab
-    const requiredInvoiceFields = [
+    // Relaxed validation - check only critical fields
+    const criticalFields = [
       'serialNumber',
       'customerName',
       'productName',
       'quantity',
-      'taxAmount',
-      'totalAmount',
-      'date'
-    ];
-
-    const requiredProductFields = [
-      'productName',
-      'quantity',
-      'unitPrice',
-      'taxAmount',
-      'priceWithTax'
-    ];
-
-    const requiredCustomerFields = [
-      'customerName',
-      'phoneNumber',
       'totalAmount'
     ];
 
-    const isValid = (
-      requiredInvoiceFields.every(field => !!data[field]) &&
-      requiredProductFields.every(field => !isNaN(parseFloat(data[field])) || !!data[field]) &&
-      requiredCustomerFields.every(field => !!data[field])
-    );
+    const isValid = criticalFields.every(field => {
+      const value = data[field];
+      if (typeof value === 'number') {
+        return !isNaN(value) && value >= 0;
+      }
+      return !!value && value.trim() !== '';
+    });
 
-    console.log('Data validation result:', isValid);
+    logger.info('Data validation result:', { isValid, data });
     return isValid;
   }
 }
